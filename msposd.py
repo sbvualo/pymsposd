@@ -1,6 +1,7 @@
 """
 
 """
+import abc
 import argparse
 import array
 import enum
@@ -25,7 +26,7 @@ MAX_Y = 22
 MAX_T = MAX_X * MAX_Y
 
 
-class Chars:
+class CharsBetaflight:
     ALT = 0x7F  # высота
     LAT = 0x89  # широто
     LON = 0x98  # долгота
@@ -53,6 +54,16 @@ class Chars:
     BAT5 = 0x95
     BAT6 = 0x96  # батарея с полным зарядом
     BAT = 0x97
+
+
+class CharsInav:
+    # See https://github.com/iNavFlight/inav/blob/master/src/main/drivers/osd_symbols.h#L26
+    LAT = 0x03
+    LON = 0x04
+    ALT = 0x76
+    SPEED_KMPH = 0x90
+    SPEED_MPH = 0x91
+    SPEED_KT = 0x92
 
 
 class Frame:
@@ -126,6 +137,34 @@ class Frame:
             sl.append('\n')
         return ''.join(sl)
 
+    @abc.abstractmethod
+    def extract_value(self, tag, reverse=False, allowed_chars=b'0123456789.-: '):
+        pass
+
+    @abc.abstractmethod
+    def extract_lat(self):
+        pass
+
+    @abc.abstractmethod
+    def extract_lon(self):
+        pass
+
+    @abc.abstractmethod
+    def extract_alt(self):
+        pass
+
+    @abc.abstractmethod
+    def extract_speed(self):
+        pass
+
+
+class FrameBetaflight(Frame):
+    """
+    Кадр OSD Betaflight
+    """
+
+    Chars = CharsBetaflight
+
     def extract_value(self, tag, reverse=False, allowed_chars=b'0123456789.-: '):
         """
         Вырезает подстроку после или до символа tag
@@ -159,9 +198,82 @@ class Frame:
         s = s.strip()
         return s, next_char
 
+    def extract_lat(self):
+        return self.extract_value(self.Chars.LAT)
+
+    def extract_lon(self):
+        return self.extract_value(self.Chars.LON)
+
+    def extract_alt(self):
+        return self.extract_value(self.Chars.ALT)
+
+    def extract_speed(self):
+        return self.extract_value(self.Chars.SPEED)
+
+
+class FrameInav(Frame):
+    """
+    Кадр OSD INAV
+    """
+    def extract_value(self, tag, reverse=False, allowed_chars=b'0123456789.-: '):
+        try:
+            idx = self.ar.index(tag)
+        except ValueError:
+            return None, None
+        x, y = idx // MAX_Y, idx % MAX_Y
+        line = self.line(y)
+        if reverse:
+            line = line[::-1]
+            x = MAX_X - 1 - x
+        sl = bytearray()
+        next_char = None
+        half_point = False
+        for i in range(x + 1, len(line)):
+            ch = line[i]
+            # Обработать цифры с точкой
+            if 0xA1 <= ch <= 0xAA:
+                chs = [ch - 0xA1 + ord(b'0'), ord(b'.')]
+                half_point = True
+            elif 0xB1 <= ch <= 0xBA:
+                if half_point:
+                    half_point = False
+                    chs = [ch - 0xB1 + ord(b'0')]
+                else:
+                    chs = [ord(b'.'), ch - 0xB1 + ord(b'0')]
+            else:
+                half_point = False
+                chs = [ch]
+            if all(x in allowed_chars for x in chs):
+                sl.extend(chs)
+            else:
+                next_char = ch
+                break
+        if reverse:
+            sl = sl[::-1]
+            next_char = tag
+        s = sl.decode('ascii')
+        s = s.strip()
+        return s, next_char
+
+    def extract_lat(self):
+        return self.extract_value(CharsInav.LAT)
+
+    def extract_lon(self):
+        return self.extract_value(CharsInav.LON)
+
+    def extract_alt(self):
+        return self.extract_value(CharsInav.ALT, reverse=True)
+
+    def extract_speed(self):
+        for tag in (CharsInav.SPEED_KMPH, CharsInav.SPEED_MPH, CharsInav.SPEED_KT):
+            v, u = self.extract_value(tag, reverse=True)
+            if v:
+                return v, u
+        return None, None
+
 
 @enum.unique
-class FontVariant(enum.Enum):
+class FontVariant(enum.IntEnum):
     """
     Варианты шрифта для разных полетных контроллеров
     """
@@ -215,7 +327,12 @@ class Reader:
         frame_data = self._fileobj.read(frame_data_size)
         if len(frame_data) != frame_data_size:
             return None
-        return Frame(frame_data)
+        if self._header['font_variant'] == FontVariant.BETAFLIGHT:
+            return FrameBetaflight(frame_data)
+        elif self._header['font_variant'] == FontVariant.INAV:
+            return FrameInav(frame_data)
+        else:
+            raise NotImplementedError('Font variant "{}" not supported yet'.format(self._header['font_variant']))
 
     def __next__(self):
         """
@@ -257,10 +374,10 @@ class Track:
             rd = Reader(fp)
             for fr in rd:
                 frame_idx = fr.header['frame_idx']
-                lat, _ = fr.extract_value(Chars.LAT)
-                lon, _ = fr.extract_value(Chars.LON)
-                alt, _ = fr.extract_value(Chars.ALT)
-                spd, _ = fr.extract_value(Chars.SPEED)
+                lat, _ = fr.extract_lat()
+                lon, _ = fr.extract_lon()
+                alt, _ = fr.extract_alt()
+                spd, _ = fr.extract_speed()
                 if all(v is None for v in (lat, lon, alt, spd)):
                     # Если не извлечено ни одного значения
                     continue
