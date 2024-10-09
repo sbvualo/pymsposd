@@ -60,6 +60,7 @@ class CharsInav:
     # See https://github.com/iNavFlight/inav/blob/master/src/main/drivers/osd_symbols.h#L26
     LAT = 0x03
     LON = 0x04
+    WATT = 0x71
     ALT = 0x76
     SPEED_KMPH = 0x90
     SPEED_MPH = 0x91
@@ -157,6 +158,10 @@ class Frame:
     def extract_speed(self):
         pass
 
+    @abc.abstractmethod
+    def extract_power(self):
+        pass
+
 
 class FrameBetaflight(Frame):
     """
@@ -210,6 +215,22 @@ class FrameBetaflight(Frame):
     def extract_speed(self):
         return self.extract_value(self.Chars.SPEED)
 
+    def extract_power(self):
+        digits = b'0123456789'
+        for idx, v in enumerate(self.ar):
+            if v == ord(b'W'):
+                if self.ar[idx - MAX_Y] in digits:
+                    if self.ar[idx + MAX_Y] in b'\x00 ':
+                        x, y = idx // MAX_Y, idx % MAX_Y
+                        line = self.line(y)
+                        s = bytearray()
+                        for i in range(x, -1, -1):
+                            if line[i] in digits:
+                                s.insert(0, line[i])
+                        val = s.decode('ascii')
+                        return val, ord(b'W')
+        return None, None
+
 
 class FrameInav(Frame):
     """
@@ -231,18 +252,32 @@ class FrameInav(Frame):
         for i in range(x + 1, len(line)):
             ch = line[i]
             # Обработать цифры с точкой
-            if 0xA1 <= ch <= 0xAA:
-                chs = [ch - 0xA1 + ord(b'0'), ord(b'.')]
-                half_point = True
-            elif 0xB1 <= ch <= 0xBA:
-                if half_point:
-                    half_point = False
-                    chs = [ch - 0xB1 + ord(b'0')]
+            if reverse:
+                if 0xA1 <= ch <= 0xAA:
+                    if half_point:
+                        chs = [ch - 0xA1 + ord(b'0')]
+                        half_point = False
+                    else:
+                        chs = [ord(b'.'), ch - 0xA1 + ord(b'0')]
+                elif 0xB1 <= ch <= 0xBA:
+                    chs = [ch - 0xB1 + ord(b'0'), ord(b'.')]
+                    half_point = True
                 else:
-                    chs = [ord(b'.'), ch - 0xB1 + ord(b'0')]
+                    half_point = False
+                    chs = [ch]
             else:
-                half_point = False
-                chs = [ch]
+                if 0xA1 <= ch <= 0xAA:
+                    chs = [ch - 0xA1 + ord(b'0'), ord(b'.')]
+                    half_point = True
+                elif 0xB1 <= ch <= 0xBA:
+                    if half_point:
+                        half_point = False
+                        chs = [ch - 0xB1 + ord(b'0')]
+                    else:
+                        chs = [ord(b'.'), ch - 0xB1 + ord(b'0')]
+                else:
+                    half_point = False
+                    chs = [ch]
             if all(x in allowed_chars for x in chs):
                 sl.extend(chs)
             else:
@@ -270,6 +305,9 @@ class FrameInav(Frame):
             if v:
                 return v, u
         return None, None
+
+    def extract_power(self):
+        return self.extract_value(CharsInav.WATT, reverse=True)
 
 
 @enum.unique
@@ -367,7 +405,7 @@ class Track:
                         empty - пустое значение
         :param fps: Частота кадров видео
         """
-        self.header = ('latitude', 'longitude', 'altitude', 'speed', 'time_ms')
+        self.header = ('latitude', 'longitude', 'altitude', 'speed', 'time_ms', 'power')
         self.points = []
         prev = [''] * len(self.header)
         with open(osdpath, 'rb') as fp:
@@ -378,25 +416,28 @@ class Track:
                 lon, _ = fr.extract_lon()
                 alt, _ = fr.extract_alt()
                 spd, _ = fr.extract_speed()
-                if all(v is None for v in (lat, lon, alt, spd)):
+                pwr, _ = fr.extract_power()
+                if all(v is None for v in (lat, lon, alt, spd, pwr)):
                     # Если не извлечено ни одного значения
                     continue
                 if onerror == 'skip':
-                    if any(i is None for i in (lat, lon, alt, spd)):
+                    if any(i is None for i in (lat, lon, alt, spd, pwr)):
                         continue
                 elif onerror == 'empty':
                     lat = lat or ''
                     lon = lon or ''
                     alt = alt or ''
                     spd = spd or ''
+                    pwr = pwr or ''
                 elif onerror == 'prev':
                     lat = lat or prev[0]
                     lon = lon or prev[1]
                     alt = alt or prev[2]
                     spd = spd or prev[3]
-                    prev[:4] = (lat, lon, alt, spd)
+                    pwr = pwr or prev[5]
+                    prev = (lat, lon, alt, spd, None, pwr)
                 ts = int(frame_idx * 1000 / fps)
-                self.points.append([lat, lon, alt, spd, ts])
+                self.points.append([lat, lon, alt, spd, ts, pwr])
 
     def save_csv(self, csvpath, encoding='ascii', sep=',', eol='\n'):
         """
@@ -410,7 +451,7 @@ class Track:
         with open(csvpath, 'w', encoding=encoding) as fp:
             fp.write(sep.join(self.header) + eol)
             for point in self.points:
-                fp.write(sep.join(point[:-1]) + sep + str(point[-1]) + eol)
+                fp.write(sep.join(str(x) for x in point) + eol)
 
 
 if __name__ == '__main__':
